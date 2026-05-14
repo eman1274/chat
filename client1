@@ -1,0 +1,180 @@
+import socket
+import threading
+import os
+import struct
+import zlib
+import json
+import io
+import tkinter as tk
+from tkinter import simpledialog, messagebox, filedialog
+from tkinter.scrolledtext import ScrolledText
+from PIL import Image, ImageTk
+
+HOST = 'trolley.proxy.rlwy.net'
+PORT = 59839
+SAVE_DIR = "client_received_files"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+MSG_TEXT = 'TEXT'
+MSG_FILE = 'FILE'
+MSG_INFO = 'INFO'
+
+IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+VIDEO_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.webm', '.flv'}
+
+def send_packet(conn, msg_type, payload_bytes, meta=None):
+    header = {'type': msg_type, 'length': len(payload_bytes), 'meta': meta or {}}
+    header_bytes = json.dumps(header).encode('utf-8')
+    conn.sendall(struct.pack('>I', len(header_bytes)))
+    conn.sendall(header_bytes)
+    conn.sendall(payload_bytes)
+
+def recv_exact(conn, n):
+    data = b''
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk: raise ConnectionError("Connection closed")
+        data += chunk
+    return data
+
+def recv_packet(conn):
+    header_len = struct.unpack('>I', recv_exact(conn, 4))[0]
+    header = json.loads(recv_exact(conn, header_len).decode('utf-8'))
+    payload = recv_exact(conn, header['length'])
+    return header['type'], payload, header.get('meta', {})
+
+def compress_data(data: bytes) -> bytes: return zlib.compress(data, level=6)
+def decompress_data(data: bytes) -> bytes: return zlib.decompress(data)
+
+def should_compress(filepath: str) -> bool:
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in VIDEO_EXTS: return False
+    if ext in IMAGE_EXTS: return True
+    return os.path.getsize(filepath) > 10_240
+
+def display_image_in_chat(chat_box, image_data: bytes, label: str):
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        img.thumbnail((250, 250))
+        photo = ImageTk.PhotoImage(img)
+        chat_box.config(state=tk.NORMAL)
+        chat_box.insert(tk.END, f"\n{label}\n", "image_label")
+        chat_box.image_create(tk.END, image=photo)
+        chat_box.insert(tk.END, "\n")
+        chat_box.config(state=tk.DISABLED)
+        chat_box.yview(tk.END)
+        if not hasattr(chat_box, '_images'): chat_box._images = []
+        chat_box._images.append(photo)
+    except Exception:
+        chat_box.config(state=tk.NORMAL)
+        chat_box.insert(tk.END, f"{label} [File saved]\n")
+        chat_box.config(state=tk.DISABLED)
+        chat_box.yview(tk.END)
+
+class ChatClient:
+    def __init__(self):
+        self.client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.username = None
+        root_tmp = tk.Tk()
+        root_tmp.withdraw()
+        self.username = simpledialog.askstring("Welcome", "Please enter your nickname:", parent=root_tmp)
+        root_tmp.destroy()
+        if not self.username: return
+        try:
+            self.client.connect((HOST, PORT))
+            send_packet(self.client, MSG_TEXT, self.username.encode('utf-8'))
+        except Exception as e:
+            messagebox.showerror("Network Error", f"Could not connect: {e}")
+            return
+        self.root = tk.Tk()
+        self._build_gui()
+        threading.Thread(target=self._receive_loop, daemon=True).start()
+        self.root.mainloop()
+
+    def _build_gui(self):
+        self.root.title(f"Messenger — {self.username}")
+        self.root.configure(bg='#282c34')
+        self.root.geometry('550x650')
+        header = tk.Frame(self.root, bg='#21252b', pady=10)
+        header.pack(fill=tk.X)
+        tk.Label(header, text=f"● {self.username}", bg='#21252b', fg='#61afef', font=('Segoe UI', 14, 'bold')).pack()
+        self.chat_box = ScrolledText(self.root, state=tk.DISABLED, bg='#21252b', fg='#abb2bf', font=('Consolas', 11), relief=tk.FLAT, wrap=tk.WORD, padx=15, pady=15)
+        self.chat_box.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        self.chat_box.tag_config('info', foreground='#e5c07b', font=('Segoe UI', 9, 'italic'))
+        self.chat_box.tag_config('self', foreground='#98c379', font=('Segoe UI', 11, 'bold'))
+        self.chat_box.tag_config('other', foreground='#61afef')
+        self.chat_box.tag_config('system', foreground='#e06c75')
+        bottom_frame = tk.Frame(self.root, bg='#282c34')
+        bottom_frame.pack(fill=tk.X, padx=15, pady=(0, 15))
+        self.entry = tk.Entry(bottom_frame, bg='#353b45', fg='#ffffff', insertbackground='white', relief=tk.FLAT, font=('Segoe UI', 11), borderwidth=10)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.entry.bind('<Return>', lambda e: self.send_text())
+        btn_style = {"relief": tk.FLAT, "font": ('Segoe UI', 10, 'bold'), "cursor": "hand2"}
+        tk.Button(bottom_frame, text='SEND', command=self.send_text, bg='#61afef', fg='#282c34', width=8, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text='📎', command=self.send_file, bg='#3e4451', fg='#ffffff', width=4, **btn_style).pack(side=tk.LEFT, padx=2)
+
+    def _append_chat(self, text: str, tag: str = 'other'):
+        self.chat_box.config(state=tk.NORMAL)
+        self.chat_box.insert(tk.END, text + '\n', tag)
+        self.chat_box.config(state=tk.DISABLED)
+        self.chat_box.yview(tk.END)
+
+    def send_text(self):
+        msg = self.entry.get().strip()
+        if not msg: return
+        try:
+            send_packet(self.client, MSG_TEXT, msg.encode('utf-8'))
+            self._append_chat(f"Me: {msg}", tag='self')
+            self.entry.delete(0, tk.END)
+        except Exception as e: self._append_chat(f"[Error: {e}]", tag='system')
+
+    def send_file(self):
+        filepath = filedialog.askopenfilename(title='Select File')
+        if not filepath: return
+        try:
+            filename = os.path.basename(filepath)
+            ext = os.path.splitext(filename)[1].lower()
+            file_type = 'image' if ext in IMAGE_EXTS else 'video' if ext in VIDEO_EXTS else 'file'
+            with open(filepath, 'rb') as f: raw_data = f.read()
+            do_compress = should_compress(filepath)
+            payload = compress_data(raw_data) if do_compress else raw_data
+            meta = {'filename': filename, 'file_type': file_type, 'compressed': do_compress, 'original_size': len(raw_data), 'ext': ext}
+            def _send():
+                try:
+                    send_packet(self.client, MSG_FILE, payload, meta=meta)
+                    self.root.after(0, lambda: self._append_chat(f"Sent: {filename}", tag='info'))
+                    if file_type == 'image':
+                        self.root.after(0, lambda: display_image_in_chat(self.chat_box, raw_data, "You shared an image:"))
+                except Exception as e:
+                    self.root.after(0, lambda: self._append_chat(f"[File Error: {e}]", tag='system'))
+            threading.Thread(target=_send, daemon=True).start()
+        except Exception as e: self._append_chat(f"[Error: {e}]", tag='system')
+
+    def _receive_loop(self):
+        while True:
+            try:
+                msg_type, payload, meta = recv_packet(self.client)
+                if msg_type == MSG_TEXT:
+                    text = payload.decode('utf-8')
+                    self.root.after(0, lambda t=text: self._append_chat(t, tag='other'))
+                elif msg_type == MSG_INFO:
+                    info = payload.decode('utf-8')
+                    self.root.after(0, lambda i=info: self._append_chat(i, tag='info'))
+                elif msg_type == MSG_FILE:
+                    sender = meta.get('sender', 'User')
+                    filename = meta.get('filename', 'file')
+                    file_type = meta.get('file_type', 'file')
+                    file_data = decompress_data(payload) if meta.get('compressed') else payload
+                    save_path = os.path.join(SAVE_DIR, f"{sender}_{filename}")
+                    with open(save_path, 'wb') as f: f.write(file_data)
+                    if file_type == 'image':
+                        self.root.after(0, lambda d=file_data, s=sender: display_image_in_chat(self.chat_box, d, f"{s} shared an image:"))
+                    else:
+                        msg = f"{sender} sent {file_type}: {filename}"
+                        self.root.after(0, lambda m=msg: self._append_chat(m, tag='other'))
+            except:
+                self.root.after(0, lambda: self._append_chat("Disconnected from server.", tag='system'))
+                break
+
+if __name__ == '__main__':
+    ChatClient()
